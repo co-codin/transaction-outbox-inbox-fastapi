@@ -1,4 +1,4 @@
-.PHONY: help up down down-v build logs logs-api logs-consumer logs-grpc test test-e2e test-broker-outage lint check migrate revision grpc-generate clean dev dev-api dev-worker dev-grpc
+.PHONY: help up down down-v build logs logs-api logs-consumer logs-inbox logs-grpc test test-e2e test-broker-outage test-inbox-integration lint check migrate revision grpc-generate clean dev dev-api dev-worker dev-inbox dev-grpc
 
 # Default target
 help: ## Show this help message
@@ -26,6 +26,9 @@ logs-api: ## Tail logs for the API service
 logs-consumer: ## Tail logs for the consumer service
 	docker compose logs -f consumer
 
+logs-inbox: ## Tail logs for the Kafka inbox worker
+	docker compose logs -f inbox
+
 logs-grpc: ## Tail logs for the gRPC service
 	docker compose logs -f grpc
 
@@ -38,6 +41,9 @@ test-e2e: ## Run end-to-end tests against the running Docker stack (make up firs
 
 test-broker-outage: ## Run RabbitMQ outage recovery test against the running Docker stack
 	E2E_BROKER_OUTAGE=1 pytest -q tests/test_broker_outage.py
+
+test-inbox-integration: ## Run Kafka inbox integration tests (requires Docker)
+	pytest -q tests/test_inbox_integration.py
 
 lint: ## Run Ruff
 	ruff check .
@@ -69,6 +75,7 @@ dev: ## Print local development setup instructions
 	@echo "Then in separate terminals:"
 	@echo "  make dev-api"
 	@echo "  make dev-worker"
+	@echo "  make dev-inbox"
 	@echo "  make dev-grpc"
 	@echo ""
 	@echo "Run tests with: make test"
@@ -78,6 +85,9 @@ dev-api: ## Run the FastAPI development server locally
 
 dev-worker: ## Run the FastStream consumer locally
 	faststream run app.worker:app --reload
+
+dev-inbox: ## Run the Kafka transactional inbox worker locally
+	python -m app.inbox_worker
 
 dev-grpc: ## Run the gRPC payment server locally
 	python -m app.grpc.server

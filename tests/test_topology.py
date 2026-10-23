@@ -1,6 +1,8 @@
 import pytest
 
 from app.messaging.topology import (
+    KAFKA_INBOX_DLQ_TOPIC,
+    KAFKA_PAYMENTS_TOPIC,
     PAYMENTS_EXCHANGE,
     PAYMENTS_NEW_QUEUE,
     PAYMENTS_NEW_ROUTING_KEY,
@@ -33,6 +35,11 @@ def test_outbox_routes_payment_events() -> None:
     assert route.exchange == PAYMENTS_EXCHANGE
     assert route.queue == PAYMENTS_NEW_QUEUE
     assert route.routing_key == PAYMENTS_NEW_ROUTING_KEY
+
+
+def test_kafka_topics_are_centralized() -> None:
+    assert KAFKA_PAYMENTS_TOPIC == "payments.events"
+    assert KAFKA_INBOX_DLQ_TOPIC == "payments.inbox.dlq"
 
 
 def test_outbox_route_rejects_unknown_event_type() -> None:

@@ -1,17 +1,19 @@
-import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.api.routes import router
+from app.core.config import settings
+from app.core.logging import configure_logging
 from app.messaging.runtime import outbox_runtime
 
-logging.basicConfig(level=logging.INFO)
+configure_logging(level=settings.log_level, json_logs=settings.log_json)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    configure_logging(level=settings.log_level, json_logs=settings.log_json)
     async with outbox_runtime() as (broker, outbox):
         app.state.broker = broker
         app.state.outbox = outbox

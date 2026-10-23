@@ -8,6 +8,7 @@ from google.protobuf.json_format import MessageToDict
 from pydantic import ValidationError
 
 from app.core.config import settings
+from app.core.logging import configure_logging
 from app.db.session import async_session_maker
 from app.grpc import payment_pb2, payment_pb2_grpc
 from app.messaging.runtime import outbox_runtime
@@ -117,7 +118,7 @@ async def serve() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    configure_logging(level=settings.log_level, json_logs=settings.log_json)
     asyncio.run(serve())
 
 

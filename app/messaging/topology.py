@@ -4,6 +4,9 @@ from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, Rabbit
 
 from app.schemas.messages import PAYMENT_CREATED_EVENT_TYPE
 
+KAFKA_PAYMENTS_TOPIC = "payments.events"
+KAFKA_INBOX_DLQ_TOPIC = "payments.inbox.dlq"
+
 PAYMENTS_EXCHANGE = RabbitExchange(
     "payments",
     type=ExchangeType.DIRECT,
