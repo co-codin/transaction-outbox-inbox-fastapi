@@ -1,12 +1,14 @@
-# Async Payment Processor
+# transaction-outbox-inbox-fastapi
 
-A FastAPI microservice that processes payments asynchronously. It accepts a
-payment request, persists it together with an outbox event in a single
-transaction, publishes the event to RabbitMQ, processes it in a background
-consumer (FastStream), and notifies the client of the final status via webhook.
+A FastAPI service that demonstrates the **transactional outbox** and
+**transactional inbox** patterns on one payment flow. The repository was
+renamed from `transaction-outbox-fastapi`.
 
-It is built around the **transactional outbox** pattern for guaranteed event
-publication, with idempotent intake, TTL-based retries, and a dead-letter queue.
+The API accepts a payment, persists it with an outbox event in a single
+database transaction, and a relay publishes that event to RabbitMQ and Kafka.
+A FastStream consumer processes the RabbitMQ copy and sends one webhook. A
+Kafka inbox consumer records the same event idempotently and applies an
+example side effect exactly once.
 
 ## Contents
 
@@ -26,46 +28,86 @@ client ──POST /payments──▶  API  ──┐  (one DB transaction)
                                    ├─▶ payments table  (status=pending)
                                    └─▶ outbox  table   (status=pending)
                                             │
-                       outbox publisher ────┘  polls pending rows,
-                       (in API process)        SELECT … FOR UPDATE SKIP LOCKED
+                       outbox relay ────────┘  SELECT … FOR UPDATE SKIP LOCKED
                                             │
-                                            ▼
-                              RabbitMQ  payments exchange
-                                            │ routing key: payments.new
-                                            ▼
-                                    [ payments.new ] ──▶ consumer
-                                            ▲                │
-                       dead-letter (TTL)    │                │ 1. lock payment row
-              [ payments.retry.1 (2s) ] ────┤                │ 2. emulate gateway (2–5s, 90% ok)
-              [ payments.retry.2 (4s) ] ────┘                │ 3. update status + processed_at
-                                            │                │ 4. POST webhook (once, guarded
-                                            │                │    by webhook_sent_at)
-                                            ┌────────────────┤
-                                            ▼  after 3 attempts
-                                    [ payments.dlq ]
+                         ┌──────────────────┴───────────────────┐
+                         ▼                                      ▼
+           RabbitMQ payments exchange                 Kafka payments.events
+           routing key: payments.new                  key = outbox id
+                         │                                      │
+                         ▼                                      ▼
+              [ payments.new ] consumer              inbox consumer (aiokafka)
+                         │                              one DB transaction:
+                         │                              INSERT inbox (unique message_id)
+                         │                              + handler side effect
+                         │                                      │
+                         │                              commit DB, then commit offset
+                         │                                      │
+                         │                                      ▼
+                         │                              inbox_effects (exactly once)
+                         │
+                         │  on poison: outbox row inbox.message.failed
+                         │                                      │
+                         │                                      ▼
+                         │                              Kafka payments.inbox.dlq
+                         ▼
+              gateway + webhook (once)
+              retries 2s, 4s, then payments.dlq
 ```
+
+## Outbox and inbox
+
+| | Transactional outbox | Transactional inbox |
+| --- | --- | --- |
+| Problem | The database commit and the broker publish are not one atomic operation. | A Kafka redelivery can apply a side effect more than once. |
+| Write | `payments` and `outbox` commit together. | The inbox row and the handler side effect commit together. |
+| Publish / consume | The relay publishes only after that commit. | The Kafka offset is committed only after the database commit. |
+| Idempotency key | `payments.idempotency_key` for intake. | `inbox.message_id` for delivery. |
+| Duplicates | The payment consumer skips terminal rows. `webhook_sent_at` blocks a second webhook. | A redelivery of a processed or failed `message_id` does not run the handler again. |
+| Failure | RabbitMQ TTL retries, then `payments.dlq`. Kafka publish failure leaves the outbox row pending. | Handler failures increment `attempts`. After the max, status becomes `failed` and one `inbox.message.failed` outbox row is relayed to `payments.inbox.dlq`. |
 
 **Flow:**
 
 1. The API validates the request, then inserts the `payment` and an `outbox`
    event in the **same transaction**, and returns `202 Accepted`.
-2. An outbox publisher loop running inside the API process claims pending outbox
-   rows (`FOR UPDATE SKIP LOCKED`) and publishes them to the `payments` exchange.
-3. A single consumer reads `payments.new` and does everything: it locks the
-   payment row, emulates the gateway (2–5 s; 90% `succeeded` / 10% `failed`),
-   persists the result, then sends the webhook and records `webhook_sent_at` or
-   `webhook_last_error`.
-4. If any step fails — processing or webhook delivery — the event is routed
-   through TTL retry queues (2 s, then 4 s) that dead-letter back to
-   `payments.new`. Already-completed steps are skipped on redelivery: a terminal
-   status skips reprocessing, and `webhook_sent_at` skips resending.
-5. After 3 total attempts the event lands in `payments.dlq` for manual
-   inspection.
+2. The outbox relay in the API process claims pending rows
+   (`FOR UPDATE SKIP LOCKED`). Payment events are published to the RabbitMQ
+   `payments` exchange and to the Kafka topic `payments.events`. The outbox row
+   is marked published only after both publishes succeed. The Kafka record key
+   and `message_id` header are the outbox id.
+3. The RabbitMQ consumer reads `payments.new`, locks the payment row, emulates
+   the gateway (2–5 s; 90% `succeeded` / 10% `failed`), persists the result,
+   then sends the webhook and records `webhook_sent_at` or `webhook_last_error`.
+4. If payment processing or webhook delivery fails, the event is routed through
+   TTL retry queues (2 s, then 4 s) that dead-letter back to `payments.new`.
+   A terminal status skips reprocessing, and `webhook_sent_at` skips resending.
+   After 3 total attempts the event lands in `payments.dlq`.
+5. The inbox worker reads `payments.events` with auto-commit disabled. For each
+   record it opens one database transaction, inserts an `inbox` row keyed by
+   `message_id`, and in the default `inline` mode runs the handler in that same
+   transaction. The handler's example side effect is one `inbox_effects` row,
+   also unique on `message_id`. The Kafka offset is committed only after the
+   database transaction commits.
+6. A crash before that database commit rolls the insert and the side effect
+   back. The offset stays uncommitted, Kafka redelivers, and the handler runs
+   again without a leftover effect. A crash after the database commit
+   redelivers too, but the unique key finds the terminal row and skips the
+   handler.
+7. A retryable handler error commits the attempt count and does **not** commit
+   the offset, then seeks back to that record so a later offset in the same
+   partition cannot be acknowledged first. After `INBOX_MAX_ATTEMPTS` (default
+   3) the row becomes `failed` and a poison outbox event is written in the same
+   transaction. The relay publishes it to `payments.inbox.dlq`. A redelivery
+   after that does not write a second poison event.
+8. `INBOX_PROCESSING_MODE=worker` stores the inbox row and commits the offset
+   immediately. A separate loop claims `received` rows with
+   `SELECT … FOR UPDATE SKIP LOCKED`, runs the same handlers, and retries or
+   dead-letters them. Run only one mode per consumer group.
 
 ## Tech Stack
 
 FastAPI · gRPC · Pydantic v2 · SQLAlchemy 2.0 (async) · PostgreSQL · RabbitMQ
-via FastStream · Alembic · Docker Compose.
+via FastStream · Kafka (KRaft) via aiokafka · Alembic · Docker Compose.
 
 ## Quick Start (Docker)
 
@@ -83,7 +125,12 @@ table.
 | API                    | http://localhost:8000                       |
 | gRPC                   | localhost:50051                             |
 | RabbitMQ management UI | http://localhost:15672 (`guest` / `guest`)  |
+| Kafka (KRaft)          | `localhost:9092` (inside Compose: `kafka:19092`) |
 | PostgreSQL             | `localhost:5433` (override `POSTGRES_PORT`) |
+
+Kafka topics `payments.events` and `payments.inbox.dlq` are created on startup.
+The `inbox` service is the Kafka consumer. The `consumer` service remains the
+RabbitMQ payment processor.
 
 ## API Reference
 
@@ -202,10 +249,11 @@ alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
-Run the consumer in a separate terminal:
+Run the RabbitMQ consumer and the Kafka inbox worker in separate terminals:
 
 ```bash
 faststream run app.worker:app --reload
+python -m app.inbox_worker
 ```
 
 Run the gRPC server in another terminal:
@@ -262,6 +310,15 @@ and defaults. The most relevant:
 | `PAYMENT_PROCESSING_MIN_SECONDS` | Lower bound of the emulated gateway delay      |
 | `PAYMENT_PROCESSING_MAX_SECONDS` | Upper bound of the emulated gateway delay      |
 | `PAYMENT_SUCCESS_RATE`           | Probability of `succeeded` (default `0.9`)     |
+| `LOG_LEVEL` / `LOG_JSON`         | Log level and JSON structured logs             |
+| `KAFKA_ENABLED`                  | Publish outbox events to Kafka (default true) |
+| `KAFKA_BOOTSTRAP_SERVERS`        | Kafka bootstrap servers                        |
+| `KAFKA_PAYMENTS_TOPIC`           | Topic for payment events (default `payments.events`) |
+| `KAFKA_INBOX_DLQ_TOPIC`          | Poison-message topic (default `payments.inbox.dlq`) |
+| `KAFKA_INBOX_GROUP_ID`           | Inbox consumer group                           |
+| `INBOX_PROCESSING_MODE`          | `inline` (default) or `worker`                 |
+| `INBOX_MAX_ATTEMPTS`             | Handler attempts before the inbox DLQ          |
+| `INBOX_RETRY_BACKOFF_SECONDS`    | Pause before redelivering a retryable record   |
 
 ## Delivery Guarantees
 
@@ -282,3 +339,22 @@ and defaults. The most relevant:
   steps are skipped on redelivery.
 - **Dead-letter queue.** After 3 failed attempts the event goes to
   `payments.dlq` for manual inspection.
+- **Transactional inbox.** The inbox insert and the handler side effect commit
+  in one database transaction. The Kafka offset is committed only after that.
+  `inbox.message_id` is unique, so a redelivery cannot apply the effect twice.
+- **Inbox retries and DLQ.** A failed handler keeps the offset uncommitted until
+  the attempt budget is exhausted. The failed row and one poison outbox event
+  commit together; the relay then publishes `payments.inbox.dlq`.
+- **Structured logs.** Process entrypoints emit one JSON object per line
+  (`LOG_JSON=true`) with fields such as `event`, `message_id`, `topic`,
+  `partition`, and `offset`. Set `LOG_JSON=false` for plain text.
+
+Inbox integration tests use Postgres and Kafka containers and are skipped when
+Docker is not available:
+
+```bash
+pytest tests/test_inbox_integration.py
+```
+
+Set `INBOX_INTEGRATION=0` to skip them even when Docker is installed. The
+RabbitMQ end-to-end suites above stay opt-in as well.

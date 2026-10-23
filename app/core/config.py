@@ -1,7 +1,10 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.messaging.topology import KAFKA_INBOX_DLQ_TOPIC, KAFKA_PAYMENTS_TOPIC
 
 
 class Settings(BaseSettings):
@@ -62,6 +65,74 @@ class Settings(BaseSettings):
         default=5.0,
         alias="WEBHOOK_TIMEOUT_SECONDS",
         gt=0,
+    )
+
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    log_json: bool = Field(default=True, alias="LOG_JSON")
+
+    kafka_enabled: bool = Field(default=True, alias="KAFKA_ENABLED")
+    kafka_bootstrap_servers: str = Field(
+        default="localhost:9092",
+        alias="KAFKA_BOOTSTRAP_SERVERS",
+    )
+    kafka_client_id: str = Field(
+        default="transaction-outbox-inbox",
+        alias="KAFKA_CLIENT_ID",
+    )
+    kafka_payments_topic: str = Field(
+        default=KAFKA_PAYMENTS_TOPIC,
+        alias="KAFKA_PAYMENTS_TOPIC",
+    )
+    kafka_inbox_dlq_topic: str = Field(
+        default=KAFKA_INBOX_DLQ_TOPIC,
+        alias="KAFKA_INBOX_DLQ_TOPIC",
+    )
+    kafka_inbox_group_id: str = Field(
+        default="payments-inbox",
+        alias="KAFKA_INBOX_GROUP_ID",
+    )
+    kafka_request_timeout_ms: int = Field(
+        default=10_000,
+        alias="KAFKA_REQUEST_TIMEOUT_MS",
+        gt=0,
+    )
+    kafka_startup_timeout_seconds: float = Field(
+        default=10.0,
+        alias="KAFKA_STARTUP_TIMEOUT_SECONDS",
+        gt=0,
+    )
+    kafka_topic_partitions: int = Field(default=1, alias="KAFKA_TOPIC_PARTITIONS", ge=1)
+    kafka_topic_replication_factor: int = Field(
+        default=1,
+        alias="KAFKA_TOPIC_REPLICATION_FACTOR",
+        ge=1,
+    )
+
+    inbox_processing_mode: Literal["inline", "worker"] = Field(
+        default="inline",
+        alias="INBOX_PROCESSING_MODE",
+    )
+    inbox_max_attempts: int = Field(default=3, alias="INBOX_MAX_ATTEMPTS", ge=1)
+    inbox_batch_size: int = Field(default=50, alias="INBOX_BATCH_SIZE", gt=0)
+    inbox_poll_interval_seconds: float = Field(
+        default=1.0,
+        alias="INBOX_POLL_INTERVAL_SECONDS",
+        gt=0,
+    )
+    inbox_retry_backoff_seconds: float = Field(
+        default=1.0,
+        alias="INBOX_RETRY_BACKOFF_SECONDS",
+        ge=0,
+    )
+    inbox_consumer_max_records: int = Field(
+        default=20,
+        alias="INBOX_CONSUMER_MAX_RECORDS",
+        ge=1,
+    )
+    inbox_poll_timeout_ms: int = Field(
+        default=1_000,
+        alias="INBOX_POLL_TIMEOUT_MS",
+        ge=0,
     )
 
     @property

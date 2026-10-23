@@ -6,6 +6,7 @@ import pytest
 
 from app.messaging.outbox import OutboxPublisher
 from app.models.outbox import OutboxStatus
+from app.schemas.inbox import INBOX_POISON_EVENT_TYPE
 from app.schemas.messages import PAYMENT_CREATED_EVENT_TYPE
 
 
@@ -62,7 +63,24 @@ def _event(event_type: str = PAYMENT_CREATED_EVENT_TYPE) -> SimpleNamespace:
     )
 
 
-def _publisher(broker, events) -> OutboxPublisher:
+class RecordingKafka:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.payments = []
+        self.poisons = []
+
+    async def publish_payment_event(self, **kwargs) -> None:
+        if self.fail:
+            raise ConnectionError("kafka unavailable")
+        self.payments.append(kwargs)
+
+    async def publish_poison_event(self, *, message_id: str, payload) -> None:
+        if self.fail:
+            raise ConnectionError("kafka unavailable")
+        self.poisons.append({"message_id": message_id, "payload": payload})
+
+
+def _publisher(broker, events, kafka=None) -> OutboxPublisher:
     return OutboxPublisher(
         broker,
         lambda: FakeSession(events),
@@ -70,6 +88,7 @@ def _publisher(broker, events) -> OutboxPublisher:
         batch_size=50,
         retention_seconds=86400,
         cleanup_interval_seconds=300,
+        kafka_publisher=kafka,
     )
 
 
@@ -101,3 +120,49 @@ async def test_outbox_success_marks_event_published() -> None:
     assert event.last_error is None
     assert isinstance(event.published_at, datetime)
     assert broker.published[0]["message"] == event.payload
+
+
+@pytest.mark.asyncio
+async def test_outbox_publishes_payment_events_to_kafka_and_rabbit() -> None:
+    event = _event()
+    broker = RecordingBroker()
+    kafka = RecordingKafka()
+    publisher = _publisher(broker, [event], kafka)
+
+    await publisher.publish_once()
+
+    assert event.status == OutboxStatus.PUBLISHED.value
+    assert kafka.payments[0]["message_id"] == str(event.id)
+    assert kafka.payments[0]["event_type"] == event.event_type
+    assert kafka.payments[0]["payload"] == event.payload
+    assert len(broker.published) == 1
+    assert kafka.poisons == []
+
+
+@pytest.mark.asyncio
+async def test_outbox_kafka_failure_keeps_event_pending() -> None:
+    event = _event()
+    broker = RecordingBroker()
+    publisher = _publisher(broker, [event], RecordingKafka(fail=True))
+
+    await publisher.publish_once()
+
+    assert event.status == OutboxStatus.PENDING.value
+    assert event.attempts == 1
+    assert event.last_error == "kafka unavailable"
+    assert len(broker.published) == 1
+
+
+@pytest.mark.asyncio
+async def test_outbox_poison_events_publish_only_to_the_dlq_topic() -> None:
+    event = _event(INBOX_POISON_EVENT_TYPE)
+    event.payload = {"message_id": "inbox-1", "event_type": "payments.new", "attempts": 3}
+    broker = RecordingBroker()
+    kafka = RecordingKafka()
+    publisher = _publisher(broker, [event], kafka)
+
+    await publisher.publish_once()
+
+    assert event.status == OutboxStatus.PUBLISHED.value
+    assert broker.published == []
+    assert kafka.poisons == [{"message_id": "inbox-1", "payload": event.payload}]

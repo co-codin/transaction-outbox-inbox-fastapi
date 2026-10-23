@@ -1,14 +1,13 @@
-import logging
-
 from faststream import FastStream
 from faststream.rabbit import Channel, RabbitBroker
 
 from app.core.config import settings
+from app.core.logging import configure_logging
 from app.messaging.topology import PAYMENTS_EXCHANGE, PAYMENTS_NEW_QUEUE, declare_topology
 from app.schemas.messages import PaymentEvent
 from app.services.processor import process_payment_event
 
-logging.basicConfig(level=logging.INFO)
+configure_logging(level=settings.log_level, json_logs=settings.log_json)
 
 broker = RabbitBroker(settings.rabbitmq_url)
 app = FastStream(broker)

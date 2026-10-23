@@ -7,10 +7,13 @@ from faststream.rabbit import RabbitBroker
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from app.core.logging import log_event
+from app.messaging.kafka import KafkaEventPublisher
 from app.messaging.topology import (
     route_for_event_type,
 )
 from app.models.outbox import OutboxEvent, OutboxStatus
+from app.schemas.inbox import INBOX_POISON_EVENT_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,7 @@ class OutboxPublisher:
         batch_size: int,
         retention_seconds: float,
         cleanup_interval_seconds: float,
+        kafka_publisher: KafkaEventPublisher | None = None,
     ) -> None:
         self._broker = broker
         self._session_factory = session_factory
@@ -32,6 +36,7 @@ class OutboxPublisher:
         self._batch_size = batch_size
         self._retention_seconds = retention_seconds
         self._cleanup_interval_seconds = cleanup_interval_seconds
+        self._kafka_publisher = kafka_publisher
         self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
@@ -75,16 +80,7 @@ class OutboxPublisher:
 
                 for event in events:
                     try:
-                        route = route_for_event_type(event.event_type)
-                        await self._broker.publish(
-                            event.payload,
-                            queue=route.queue,
-                            exchange=route.exchange,
-                            routing_key=route.routing_key,
-                            persist=True,
-                            message_id=str(event.id),
-                            message_type=event.event_type,
-                        )
+                        await self._publish_event(event)
                     except Exception as exc:
                         event.attempts += 1
                         event.last_error = str(exc)[:2000]
@@ -98,8 +94,46 @@ class OutboxPublisher:
                         event.status = OutboxStatus.PUBLISHED.value
                         event.published_at = datetime.now(UTC)
                         event.last_error = None
+                        log_event(
+                            logger,
+                            logging.INFO,
+                            "outbox_event_published",
+                            outbox_id=str(event.id),
+                            event_type=event.event_type,
+                            kafka=self._kafka_publisher is not None
+                            or event.event_type == INBOX_POISON_EVENT_TYPE,
+                        )
 
         return len(events)
+
+    async def _publish_event(self, event: OutboxEvent) -> None:
+        if event.event_type == INBOX_POISON_EVENT_TYPE:
+            if self._kafka_publisher is None:
+                raise RuntimeError("Kafka publisher is not configured")
+            message_id = str(event.payload.get("message_id") or event.id)
+            await self._kafka_publisher.publish_poison_event(
+                message_id=message_id,
+                payload=event.payload,
+            )
+            return
+
+        route = route_for_event_type(event.event_type)
+        await self._broker.publish(
+            event.payload,
+            queue=route.queue,
+            exchange=route.exchange,
+            routing_key=route.routing_key,
+            persist=True,
+            message_id=str(event.id),
+            message_type=event.event_type,
+        )
+        if self._kafka_publisher is not None:
+            await self._kafka_publisher.publish_payment_event(
+                message_id=str(event.id),
+                event_type=event.event_type,
+                aggregate_id=str(event.aggregate_id),
+                payload=event.payload,
+            )
 
     async def purge_published(self) -> int:
         cutoff = datetime.now(UTC) - timedelta(seconds=self._retention_seconds)
